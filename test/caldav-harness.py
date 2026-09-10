@@ -36,6 +36,11 @@ def control(base: str, payload: dict) -> None:
         response.read()
 
 
+def server_state(base: str) -> dict:
+    with urllib.request.urlopen(base + "/_control/state", timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def start_server() -> tuple[subprocess.Popen, str]:
     proc = subprocess.Popen(
         [sys.executable, str(ROOT / "test" / "fake-caldav.py"), "--user", USER, "--password", PASSWORD],
@@ -181,6 +186,172 @@ def run() -> int:
         probe_status, probe_body = mod.caldav_propfind(work["href"], USER, PASSWORD)
         supported, probed_token, ctag = mod.parse_sync_probe(probe_body) if probe_status in (200, 207) else (False, "", "")
         check("calendar advertises sync-collection", supported is True and probed_token.startswith("http://example.test/ns/sync/"), str((supported, probed_token, ctag)))
+
+        adaptive_proc, adaptive_base = start_server()
+        original_events_from_ics = mod.events_from_ics
+        try:
+            time.sleep(0.05)
+            adaptive_work = next(item for item in mod.discover_caldav_calendars(adaptive_base + "/", USER, PASSWORD) if item["name"] == "Work")
+            href = adaptive_work["href"]
+            calendar = {"id": "work", "name": "Work", "color": "#000", "provider": "caldav", "host": "127.0.0.1", "source": "test"}
+            window_start = datetime.now(UTC) - timedelta(days=400)
+            window_end = datetime.now(UTC) + timedelta(days=400)
+
+            def fake_events_from_ics(ics, cal, _client, _modules, _start, _end):
+                values = {}
+                if "BEGIN:VEVENT" not in str(ics):
+                    return [], False
+                for line in str(ics).splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key in ("UID", "SUMMARY"):
+                        values[key] = value.strip()
+                if not values.get("UID"):
+                    return [], False
+                if values.get("SUMMARY") == "Expand":
+                    return [{"id": f"{cal['id']}:{values['UID']}:{index}", "uid": f"{values['UID']}:{index}", "calendarId": cal["id"], "title": "Expand"} for index in range(3)], True
+                return [{"id": f"{cal['id']}:{values['UID']}", "uid": values["UID"], "calendarId": cal["id"], "title": values.get("SUMMARY", "")}], True
+
+            mod.events_from_ics = fake_events_from_ics
+            cache = {"events": [], "syncState": {}, "_removed": {}}
+            state = cache["syncState"]
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "page-a", "uid": "page-a@test"})
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "page-b", "uid": "page-b@test"})
+            control(adaptive_base, {"op": "config", "page_size": 1})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, "", calendar, None, None, object(), window_start, window_end, cache, state, "work", "", [], False, replace=True)
+            cache["events"] = synced
+            stats = server_state(adaptive_base)["stats"]
+            check("paged initial sync commits all pages", mode == "updated" and {event["uid"] for event in synced} == {"uid-alpha@test", "page-a@test", "page-b@test"} and stats["sync"] == 3, str((mode, synced, stats)))
+            check("paged initial sync commits terminal token", state["work"]["token"].endswith("/5"), str(state))
+
+            old_token = state["work"]["token"]
+            old_events = list(cache["events"])
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "fail-a", "uid": "fail-a@test"})
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "fail-b", "uid": "fail-b@test"})
+            control(adaptive_base, {"op": "config", "report_fail_after": 1})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, old_token, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", old_events, True)
+            check("interrupted page sequence preserves cache", mode == "unchanged" and synced == [] and cache["events"] == old_events)
+            check("interrupted page sequence preserves token", state["work"]["token"] == old_token, str(state))
+
+            control(adaptive_base, {"op": "config", "report_fail_after": 0})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, old_token, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", old_events, True)
+            cache["events"] = synced
+            check("paged retry applies complete transaction", mode == "updated" and {"fail-a@test", "fail-b@test"}.issubset({event["uid"] for event in synced}), str((mode, synced)))
+
+            token_before = state["work"]["token"]
+            events_before = list(cache["events"])
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "expand", "uid": "expand@test", "summary": "Expand"})
+            old_max_events = mod.MAX_EVENTS
+            mod.MAX_EVENTS = len(events_before) + 1
+            try:
+                mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", events_before, True)
+            finally:
+                mod.MAX_EVENTS = old_max_events
+            check("expanded event limit preserves cache and token", mode == "unchanged" and synced == [] and cache["events"] == events_before and state["work"]["token"] == token_before, str((mode, state)))
+            control(adaptive_base, {"op": "delete", "calendar": "work", "filename": "expand"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", events_before, True)
+            cache["events"] = synced
+            check("sync recovers after expanded event rejection", mode == "updated" and state["work"]["token"] != token_before, str((mode, state)))
+
+            token_before = state["work"]["token"]
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "metadata", "uid": "metadata@test"})
+            control(adaptive_base, {"op": "config", "page_size": 0, "omit_inline": True, "multiget_supported": True})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", cache["events"], True)
+            cache["events"] = synced
+            stats = server_state(adaptive_base)["stats"]
+            check("missing inline data uses multiget", mode == "updated" and any(event["uid"] == "metadata@test" for event in synced) and stats["multiget"] == 1 and stats["get"] == 0, str(stats))
+
+            token_before = state["work"]["token"]
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "get-fallback", "uid": "get-fallback@test"})
+            control(adaptive_base, {"op": "config", "multiget_supported": False})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", cache["events"], True)
+            cache["events"] = synced
+            stats = server_state(adaptive_base)["stats"]
+            check("unsupported multiget falls back to GET", mode == "updated" and any(event["uid"] == "get-fallback@test" for event in synced) and stats["multiget"] == 1 and stats["get"] == 1, str(stats))
+
+            token_before = state["work"]["token"]
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "no-limit", "uid": "no-limit@test"})
+            control(adaptive_base, {"op": "config", "omit_inline": False, "multiget_supported": True, "limit_mode": "reject"})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", cache["events"], True)
+            cache["events"] = synced
+            stats = server_state(adaptive_base)["stats"]
+            check("rejected DAV limit retries without limit", mode == "updated" and any(event["uid"] == "no-limit@test" for event in synced) and stats["sync"] == 2, str(stats))
+
+            token_before = state["work"]["token"]
+            for index in range(4):
+                control(adaptive_base, {"op": "put", "calendar": "work", "filename": f"large-{index}", "uid": f"large-{index}@test", "summary": "X" * 500})
+            control(adaptive_base, {"op": "config", "limit_mode": "honor"})
+            control(adaptive_base, {"op": "reset-stats"})
+            old_limit = mod.MAX_CALDAV_RESPONSE_BYTES
+            mod.MAX_CALDAV_RESPONSE_BYTES = 2600
+            try:
+                mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", cache["events"], True)
+            finally:
+                mod.MAX_CALDAV_RESPONSE_BYTES = old_limit
+            cache["events"] = synced
+            stats = server_state(adaptive_base)["stats"]
+            check("oversized inline page uses split multiget", mode == "updated" and all(any(event["uid"] == f"large-{index}@test" for event in synced) for index in range(4)) and stats["sync"] == 2 and stats["multiget"] >= 3, str((mode, stats)))
+
+            token_before = state["work"]["token"]
+            events_before = list(cache["events"])
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "too-large", "uid": "too-large@test", "summary": "Y" * 5000})
+            control(adaptive_base, {"op": "reset-stats"})
+            mod.MAX_CALDAV_RESPONSE_BYTES = 2000
+            try:
+                mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", events_before, True)
+            finally:
+                mod.MAX_CALDAV_RESPONSE_BYTES = old_limit
+            check("oversized singleton preserves cache and token", mode == "unchanged" and synced == [] and cache["events"] == events_before and state["work"]["token"] == token_before, str((mode, state)))
+
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "repeat-a", "uid": "repeat-a@test"})
+            control(adaptive_base, {"op": "put", "calendar": "work", "filename": "repeat-b", "uid": "repeat-b@test"})
+            control(adaptive_base, {"op": "config", "page_size": 1, "repeat_token": True})
+            control(adaptive_base, {"op": "reset-stats"})
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, token_before, calendar, None, None, object(), window_start, window_end, cache, state, "work", "", events_before, True)
+            check("repeated partial token aborts transaction", mode == "unchanged" and synced == [] and state["work"]["token"] == token_before)
+            check("cross-origin event href is rejected", not mod.safe_event_href(href, "https://attacker.invalid/event.ics"))
+            check("encoded traversal event hrefs are rejected", all(not mod.safe_event_href(href, value) for value in (href + "%2e%2e/private.ics", href + "%252e%252e/private.ics", href + "safe%2f..%2fprivate.ics", href + "..\\private.ics")))
+            vtodo = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:task@test\r\nSUMMARY:Literal BEGIN:VEVENT text\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+            ignored, failures = mod.ingest_changed_items([{"uid": "task", "href": href + "task.ics", "ics": vtodo}], calendar, None, object(), window_start, window_end, USER, PASSWORD)
+            check("valid non-event calendar data advances sync", ignored == [] and failures == [], str((ignored, failures)))
+            malformed_non_events = (
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nEND:VCALENDAR\r\n",
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nSUMMARY:Broken\r\nEND:VCALENDAR\r\n",
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nSUMMARY:No UID\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task@test\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+            )
+            malformed_failures = []
+            for index, malformed in enumerate(malformed_non_events):
+                _ignored, item_failures = mod.ingest_changed_items([{"uid": f"bad-{index}", "href": href + f"bad-{index}.ics", "ics": malformed}], calendar, None, object(), window_start, window_end, USER, PASSWORD)
+                malformed_failures.extend(item_failures)
+            check("malformed non-event calendar data holds token", malformed_failures == ["bad-0", "bad-1", "bad-2", "bad-3"], str(malformed_failures))
+
+            attacker_proc, attacker_base = start_server()
+            try:
+                time.sleep(0.05)
+                control(attacker_base, {"op": "reset-stats"})
+                control(adaptive_base, {"op": "config", "discovery_home": attacker_base + "/dav/user/"})
+                discovered = mod.discover_caldav_calendars(adaptive_base + "/", USER, PASSWORD)
+                attacker_stats = server_state(attacker_base)["stats"]
+                check("cross-origin discovery target receives no credentials", bool(discovered) and attacker_stats["propfind"] == 0 and attacker_stats["authorized"] == 0, str(attacker_stats))
+            finally:
+                attacker_proc.terminate()
+                try:
+                    attacker_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    attacker_proc.kill()
+        finally:
+            mod.events_from_ics = original_events_from_ics
+            adaptive_proc.terminate()
+            try:
+                adaptive_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                adaptive_proc.kill()
 
         source_webdav_url = mod.source_webdav_url
         lookup_source_credentials = mod.lookup_source_credentials

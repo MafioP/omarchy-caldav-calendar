@@ -13,13 +13,18 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import urllib.error
 import urllib.request
 
@@ -27,9 +32,105 @@ MAX_CACHE_BYTES = 8 * 1024 * 1024
 MAX_REMINDER_BYTES = 256 * 1024
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_ERROR_BYTES = 64 * 1024
+MAX_CALDAV_RESPONSE_BYTES = 32 * 1024 * 1024
+CALDAV_READ_CHUNK = 64 * 1024
 MAX_EVENTS = 8000
+CALDAV_SYNC_PAGE_SIZE = 64
+CALDAV_MULTIGET_BATCH_SIZE = 64
+MAX_CALDAV_SYNC_PAGES = 128
+MAX_CALDAV_REQUESTS = MAX_EVENTS + 2 * MAX_CALDAV_SYNC_PAGES
+CALDAV_SYNC_SECONDS = 45.0
 MAX_CALENDARS = 200
 MAX_FIRED = 2000
+
+
+class CaldavResponseTooLarge(ValueError):
+    def __init__(self) -> None:
+        super().__init__("Calendar server response was too large.")
+
+
+def http_content_length(headers) -> int | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    raw = getter("Content-Length") if callable(getter) else None
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def close_http_error(error) -> None:
+    closer = getattr(error, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:
+            return
+
+
+def set_http_read_timeout(response, timeout: float) -> None:
+    try:
+        response.fp.raw._sock.settimeout(max(0.001, timeout))
+    except (AttributeError, OSError):
+        pass
+
+
+@contextmanager
+def enforce_http_deadline(timeout: float):
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+
+    def timeout_handler(_signum, _frame):
+        raise TimeoutError("Calendar server timed out.")
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    alarm = min(timeout, previous_delay) if previous_delay > 0 else timeout
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, alarm))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_delay > 0:
+            elapsed = time.monotonic() - started
+            signal.setitimer(signal.ITIMER_REAL, max(0.001, previous_delay - elapsed), previous_interval)
+
+
+def read_limited_http_body(response, max_bytes: int | None = None, deadline: float | None = None) -> bytes:
+    if max_bytes is None:
+        max_bytes = MAX_CALDAV_RESPONSE_BYTES
+    declared = http_content_length(getattr(response, "headers", None))
+    if declared is not None and declared > max_bytes:
+        raise CaldavResponseTooLarge()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Calendar server timed out.")
+            set_http_read_timeout(response, remaining)
+        reader = getattr(response, "read1", None)
+        if not callable(reader):
+            reader = response.read
+        chunk = reader(min(CALDAV_READ_CHUNK, max_bytes - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise CaldavResponseTooLarge()
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def read_limited_text(path: Path, max_bytes: int) -> str | None:
@@ -893,6 +994,8 @@ def parse_caldav_multistatus(xml_bytes: bytes, base_url: str) -> tuple[list[dict
     for response in root.iter(f"{DAV_NS}response"):
         href = (response.findtext(f"{DAV_NS}href") or "").strip()
         absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
+        if not same_origin_url(base_url, absolute):
+            continue
         resourcetype = response.find(f".//{DAV_NS}resourcetype")
         is_calendar = resourcetype is not None and resourcetype.find(f"{CALDAV_NS}calendar") is not None
         name = (response.findtext(f".//{DAV_NS}displayname") or "").strip()
@@ -900,12 +1003,14 @@ def parse_caldav_multistatus(xml_bytes: bytes, base_url: str) -> tuple[list[dict
             calendars.append({"href": absolute, "name": name})
         for home in response.iter(f"{CALDAV_NS}calendar-home-set"):
             home_href = (home.findtext(f"{DAV_NS}href") or "").strip()
-            if home_href:
-                homes.append(urljoin(absolute, home_href))
+            home_url = urljoin(absolute, home_href)
+            if home_href and same_origin_url(base_url, home_url):
+                homes.append(home_url)
         for principal in response.iter(f"{DAV_NS}current-user-principal"):
             principal_href = (principal.findtext(f"{DAV_NS}href") or "").strip()
-            if principal_href:
-                principals.append(urljoin(absolute, principal_href))
+            principal_url = urljoin(absolute, principal_href)
+            if principal_href and same_origin_url(base_url, principal_url):
+                principals.append(principal_url)
     return calendars, homes, principals
 
 
@@ -919,11 +1024,16 @@ def caldav_propfind(url: str, username: str, password: str, timeout: float = 8.0
     origin = f"{parsed.scheme}://{parsed.netloc}"
     manager.add_password(None, origin, username, password)
     opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(manager))
+    deadline = time.monotonic() + timeout
     try:
-        with opener.open(request, timeout=timeout) as response:
-            return int(getattr(response, "status", 200) or 200), response.read()
+        with enforce_http_deadline(timeout):
+            with opener.open(request, timeout=timeout) as response:
+                return int(getattr(response, "status", 200) or 200), read_limited_http_body(response, deadline=deadline)
     except urllib.error.HTTPError as error:
-        return int(error.code), error.read() if error.fp else b""
+        close_http_error(error)
+        return int(error.code), b""
+    except CaldavResponseTooLarge:
+        raise
     except TimeoutError as error:
         raise ValueError("Calendar server timed out.") from error
     except urllib.error.URLError as error:
@@ -1127,14 +1237,38 @@ def eds_setup_caldav(payload: dict) -> dict:
     }
 
 
+def sync_report_body(sync_token: str, *, include_calendar_data: bool = True, limited: bool = True) -> bytes:
+    limit = f"<d:limit><d:nresults>{CALDAV_SYNC_PAGE_SIZE}</d:nresults></d:limit>" if limited else ""
+    calendar_data = "<c:calendar-data/>" if include_calendar_data else ""
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:sync-token>{xml_escape(sync_token)}</d:sync-token>
+  <d:sync-level>1</d:sync-level>
+  {limit}
+  <d:prop>
+    <d:getetag/>
+    {calendar_data}
+  </d:prop>
+</d:sync-collection>
+""".encode()
+
+
+def multiget_report_body(hrefs: list[str]) -> bytes:
+    href_xml = "".join(f"<d:href>{xml_escape(href)}</d:href>" for href in hrefs)
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  {href_xml}
+</c:calendar-multiget>
+""".encode()
+
+
 SYNC_REPORT_BODY = """<?xml version="1.0" encoding="utf-8"?>
 <d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:sync-token>{token}</d:sync-token>
   <d:sync-level>1</d:sync-level>
-  <d:prop>
-    <d:getetag/>
-    <c:calendar-data/>
-  </d:prop>
+  <d:limit><d:nresults>64</d:nresults></d:limit>
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
 </d:sync-collection>
 """
 SYNC_PROBE_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
@@ -1170,7 +1304,7 @@ def lookup_source_credentials(source, registry, modules: EdsModules) -> tuple[st
     return str(username), str(password)
 
 
-def caldav_http(method: str, url: str, username: str, password: str, body: bytes = b"", headers: dict | None = None, timeout: float = 25.0) -> tuple[int, bytes, object]:
+def caldav_http(method: str, url: str, username: str, password: str, body: bytes = b"", headers: dict | None = None, timeout: float = 25.0, *, raise_too_large: bool = False) -> tuple[int, bytes, object]:
     request = urllib.request.Request(url, data=body or None, method=method)
     request.add_header("User-Agent", "CalDav-Calendar/1.0")
     for key, value in (headers or {}).items():
@@ -1180,11 +1314,20 @@ def caldav_http(method: str, url: str, username: str, password: str, body: bytes
     origin = f"{parsed.scheme}://{parsed.netloc}"
     manager.add_password(None, origin, username, password)
     opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(manager))
+    deadline = time.monotonic() + timeout
     try:
-        with opener.open(request, timeout=timeout) as response:
-            return int(getattr(response, "status", 200) or 200), response.read(), response.headers
+        with enforce_http_deadline(timeout):
+            with opener.open(request, timeout=timeout) as response:
+                return int(getattr(response, "status", 200) or 200), read_limited_http_body(response, deadline=deadline), response.headers
     except urllib.error.HTTPError as error:
-        return int(error.code), error.read() if error.fp else b"", error.headers
+        headers = error.headers
+        close_http_error(error)
+        return int(error.code), b"", headers
+    except CaldavResponseTooLarge:
+        sync_log("sync-http-too-large", method=method, host=parsed.hostname or "")
+        if raise_too_large:
+            raise
+        return 0, b"", None
     except Exception as error:
         sync_log("sync-http-error", method=method, host=parsed.hostname or "", error=str(error)[:200])
         return 0, b"", None
@@ -1230,7 +1373,12 @@ def parse_sync_probe(xml_bytes: bytes) -> tuple[bool, str, str]:
     return supported, token, ctag
 
 
-def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[dict], list[str], bool]:
+def dav_status_code(status_text: str) -> int:
+    match = re.search(r"(?:^|\s)(\d{3})(?:\s|$)", status_text or "")
+    return int(match.group(1)) if match else 0
+
+
+def parse_dav_items(xml_bytes: bytes, base_url: str) -> tuple[str, list[dict], list[dict], bool]:
     root = ET.fromstring(xml_bytes)
     token = ""
     for node in root.iter(f"{DAV_NS}sync-token"):
@@ -1244,22 +1392,44 @@ def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[di
         if not href:
             continue
         absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
-        if not href_is_event_resource(absolute):
-            continue
-        status_text = " ".join((node.text or "") for node in response.iter(f"{DAV_NS}status"))
-        if "404" in status_text:
-            removed.append(href_event_uid(absolute))
-            continue
-        if "507" in status_text:
+        response_status = dav_status_code(response.findtext(f"{DAV_NS}status") or "")
+        if response_status == 507:
             truncated = True
             continue
-        calendar_data = ""
-        for node in response.iter(f"{CALDAV_NS}calendar-data"):
-            calendar_data = "".join(node.itertext()).strip()
-            if calendar_data:
-                break
-        changed.append({"href": absolute, "uid": href_event_uid(absolute), "ics": calendar_data})
+        if not href_is_event_resource(absolute):
+            continue
+        uid = href_event_uid(absolute)
+        if response_status in (404, 410):
+            removed.append({"href": absolute, "uid": uid})
+            continue
+        if response_status and not 200 <= response_status < 300:
+            continue
+        for propstat in response.findall(f"{DAV_NS}propstat"):
+            prop_status = dav_status_code(propstat.findtext(f"{DAV_NS}status") or "")
+            if not 200 <= prop_status < 300:
+                continue
+            prop = propstat.find(f"{DAV_NS}prop")
+            if prop is None:
+                continue
+            calendar_data = "".join((prop.findtext(f"{CALDAV_NS}calendar-data") or "").splitlines(keepends=True)).strip()
+            changed.append(
+                {
+                    "href": absolute,
+                    "uid": uid,
+                    "etag": (prop.findtext(f"{DAV_NS}getetag") or "").strip(),
+                    "ics": calendar_data,
+                }
+            )
+            break
+        else:
+            if response_status in (200, 204):
+                changed.append({"href": absolute, "uid": uid, "etag": "", "ics": ""})
     return token, changed, removed, truncated
+
+
+def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[dict], list[str], bool]:
+    token, changed, removed, truncated = parse_dav_items(xml_bytes, base_url)
+    return token, changed, [item["uid"] for item in removed], truncated
 
 
 def event_sync_keys(event: dict | None) -> set[str]:
@@ -1336,16 +1506,227 @@ def events_from_ics(ics_text: str, calendar: dict, client, modules: EdsModules, 
     events: list = []
     incomplete = False
     for component in components:
-        before = len(events)
         append_component_events(client, component, calendar, window_start, window_end, events, modules)
         recurring = hasattr(component, "has_recurrences") and component.has_recurrences()
-        if len(events) == before or (recurring and client is None):
+        if recurring and client is None:
             incomplete = True
-    return events, bool(events) and not incomplete
+    return events, not incomplete
 
 
 def ics_missing_vevent(ics_text: str) -> bool:
     return "BEGIN:VEVENT" not in str(ics_text or "").upper()
+
+
+def ics_data_missing(ics_text: str) -> bool:
+    return not str(ics_text or "").strip()
+
+
+def valid_non_event_calendar_data(ics_text: str, modules: EdsModules) -> bool:
+    unfolded = str(ics_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    unfolded = re.sub(r"\n[ \t]", "", unfolded)
+    stack = []
+    primary_uids = []
+    root_count = 0
+    has_version = False
+    has_prodid = False
+    has_event = False
+    for raw_line in unfolded.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        name, separator, value = line.partition(":")
+        if not separator:
+            return False
+        property_name = name.split(";", 1)[0].upper()
+        component_name = value.strip().upper()
+        if property_name == "BEGIN":
+            if not re.fullmatch(r"[A-Z0-9-]+", component_name):
+                return False
+            if not stack:
+                root_count += 1
+                if root_count != 1 or component_name != "VCALENDAR":
+                    return False
+            if component_name == "VEVENT":
+                has_event = True
+            if len(stack) == 1 and component_name not in ("VEVENT", "VTIMEZONE"):
+                primary_uids.append(False)
+            stack.append(component_name)
+        elif property_name == "END":
+            if not stack or stack.pop() != component_name:
+                return False
+        elif not stack:
+            return False
+        elif len(stack) == 1 and property_name == "VERSION" and value.strip():
+            has_version = True
+        elif len(stack) == 1 and property_name == "PRODID" and value.strip():
+            has_prodid = True
+        elif len(stack) == 2 and stack[-1] not in ("VEVENT", "VTIMEZONE") and property_name == "UID" and value.strip():
+            primary_uids[-1] = True
+    if stack or root_count != 1 or not has_version or not has_prodid or has_event or not primary_uids or not all(primary_uids):
+        return False
+    try:
+        parser = modules.ICalGLib.Component.new_from_string
+    except AttributeError:
+        return True
+    try:
+        return parser(str(ics_text or "")) is not None
+    except Exception:
+        return False
+
+
+def url_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(url)
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    try:
+        port = parsed.port or default_port
+    except ValueError:
+        port = -1
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+
+def same_origin_url(base_url: str, candidate_url: str) -> bool:
+    parsed = urlsplit(candidate_url)
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname) and not parsed.username and not parsed.password and url_origin(base_url) == url_origin(candidate_url)
+
+
+def normalized_request_path(path: str) -> str | None:
+    if "\\" in path or re.search(r"%(?:2f|5c)", path, re.I):
+        return None
+    decoded = path
+    for _attempt in range(3):
+        decoded = unquote(decoded)
+        if "\\" in decoded or any(segment in (".", "..") for segment in decoded.split("/")):
+            return None
+    return decoded
+
+
+def safe_event_href(collection_url: str, event_href: str) -> bool:
+    collection = urlsplit(collection_url)
+    event = urlsplit(event_href)
+    if event.fragment or not same_origin_url(collection_url, event_href):
+        return False
+    collection_path = normalized_request_path(collection.path or "/")
+    event_path = normalized_request_path(event.path or "/")
+    if collection_path is None or event_path is None:
+        return False
+    prefix = collection_path if collection_path.endswith("/") else collection_path + "/"
+    return event_path.startswith(prefix) and href_is_event_resource(event_href)
+
+
+def dav_href_path(href: str) -> str:
+    parsed = urlsplit(href)
+    return (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+
+
+def canonical_href(href: str) -> str:
+    parsed = urlsplit(href)
+    scheme, host, port = url_origin(href)
+    default_port = 443 if scheme == "https" else 80
+    authority = host if port == default_port else f"{host}:{port}"
+    return f"{scheme}://{authority}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+def budgeted_caldav_http(budget: list[int], deadline: float, method: str, url: str, username: str, password: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes, object]:
+    remaining = deadline - time.monotonic()
+    if budget[0] >= MAX_CALDAV_REQUESTS or remaining <= 0:
+        return 0, b"", None
+    budget[0] += 1
+    return caldav_http(method, url, username, password, body, headers, min(25.0, remaining), raise_too_large=True)
+
+
+def fetch_multiget_batch(collection_url: str, items: list[dict], username: str, password: str, budget: list[int], deadline: float) -> tuple[list[dict], list[str], list[dict], bool]:
+    body = multiget_report_body([dav_href_path(item["href"]) for item in items])
+    try:
+        status, payload, _headers = budgeted_caldav_http(
+            budget,
+            deadline,
+            "REPORT",
+            collection_url,
+            username,
+            password,
+            body,
+            {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        )
+    except CaldavResponseTooLarge:
+        if len(items) > 1:
+            midpoint = len(items) // 2
+            left = fetch_multiget_batch(collection_url, items[:midpoint], username, password, budget, deadline)
+            right = fetch_multiget_batch(collection_url, items[midpoint:], username, password, budget, deadline)
+            return left[0] + right[0], left[1] + right[1], left[2] + right[2], left[3] and right[3]
+        return [], [], items, True
+    if status in (400, 405, 415, 501):
+        return [], [], items, False
+    if status not in (200, 207):
+        return [], [], items, True
+    try:
+        _token, returned, removed, _truncated = parse_dav_items(payload, collection_url)
+    except ET.ParseError:
+        return [], [], items, True
+    returned_by_href = {canonical_href(item["href"]): item for item in returned}
+    removed_hrefs = {canonical_href(item["href"]): item["uid"] for item in removed}
+    hydrated = []
+    removed_uids = []
+    unresolved = []
+    for requested in items:
+        key = canonical_href(requested["href"])
+        if key in removed_hrefs:
+            removed_uids.append(requested["uid"])
+            continue
+        result = returned_by_href.get(key)
+        if result and not ics_data_missing(result.get("ics") or ""):
+            requested_etag = str(requested.get("etag") or "")
+            result_etag = str(result.get("etag") or "")
+            if requested_etag and result_etag and requested_etag != result_etag:
+                unresolved.append(requested)
+            else:
+                hydrated.append({**requested, "etag": result_etag or requested_etag, "ics": result["ics"]})
+        else:
+            unresolved.append(requested)
+    return hydrated, removed_uids, unresolved, True
+
+
+def hydrate_changed_items(collection_url: str, changed: list[dict], username: str, password: str, budget: list[int], deadline: float) -> tuple[list[dict], list[str], list[str]]:
+    hydrated = [item for item in changed if not ics_data_missing(item.get("ics") or "")]
+    missing = [item for item in changed if ics_data_missing(item.get("ics") or "")]
+    safe = []
+    failed_uids = []
+    for item in missing:
+        if safe_event_href(collection_url, str(item.get("href") or "")):
+            safe.append(item)
+        elif item.get("uid"):
+            failed_uids.append(str(item["uid"]))
+
+    unresolved = []
+    removed_uids = []
+    multiget_supported = True
+    for offset in range(0, len(safe), CALDAV_MULTIGET_BATCH_SIZE):
+        batch = safe[offset : offset + CALDAV_MULTIGET_BATCH_SIZE]
+        if multiget_supported:
+            got, removed, remaining, multiget_supported = fetch_multiget_batch(collection_url, batch, username, password, budget, deadline)
+            hydrated.extend(got)
+            removed_uids.extend(removed)
+            unresolved.extend(remaining)
+        else:
+            unresolved.extend(batch)
+
+    for item in unresolved:
+        try:
+            status, raw, response_headers = budgeted_caldav_http(budget, deadline, "GET", item["href"], username, password)
+        except CaldavResponseTooLarge:
+            status, raw, response_headers = 0, b"", None
+        if status in (404, 410):
+            removed_uids.append(item["uid"])
+            continue
+        if status != 200:
+            failed_uids.append(item["uid"])
+            continue
+        expected_etag = str(item.get("etag") or "")
+        actual_etag = str(response_headers.get("ETag") or "") if response_headers is not None else ""
+        if expected_etag and actual_etag and expected_etag != actual_etag:
+            failed_uids.append(item["uid"])
+            continue
+        hydrated.append({**item, "etag": actual_etag or expected_etag, "ics": raw.decode("utf-8", "replace")})
+    return hydrated, removed_uids, failed_uids
 
 
 def ingest_changed_items(changed: list, calendar: dict, client, modules: EdsModules, window_start: datetime, window_end: datetime, username: str, password: str) -> tuple[list, list]:
@@ -1353,20 +1734,15 @@ def ingest_changed_items(changed: list, calendar: dict, client, modules: EdsModu
     failed_uids = []
     for item in changed:
         ics = item.get("ics") or ""
-        if ics_missing_vevent(ics) and item.get("href"):
-            _status, raw, _hdrs = caldav_http("GET", item["href"], username, password, b"", {})
-            if _status == 200:
-                ics = raw.decode("utf-8", "replace")
-            else:
-                sync_log("sync-ics-get-failed", href=str(item.get("href") or "")[:160], status=_status)
-                if _status in (400, 404, 405, 410):
-                    continue
-                if item.get("uid"):
-                    failed_uids.append(str(item["uid"]))
-                continue
+        if ics_data_missing(ics):
+            if item.get("uid"):
+                failed_uids.append(str(item["uid"]))
+            continue
+        if valid_non_event_calendar_data(ics, modules):
+            continue
         parsed, complete = events_from_ics(ics, calendar, client, modules, window_start, window_end)
         href_uid = str(item.get("uid") or "")
-        if complete and parsed:
+        if complete:
             for event in parsed:
                 if href_uid:
                     event["hrefUid"] = href_uid
@@ -1412,60 +1788,124 @@ def ctag_decision(state: dict, calendar_id: str, ctag: str, if_changed: bool) ->
 
 
 def apply_collection_report(href: str, username: str, password: str, token: str, calendar: dict, client, source, modules: EdsModules, window_start: datetime, window_end: datetime, cache: dict | None, state: dict, calendar_id: str, ctag: str, cached_events: list, if_changed: bool, replace: bool = False) -> tuple[str, list, list]:
-    body = SYNC_REPORT_BODY.format(token=token.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")).encode("utf-8")
-    status, payload, _headers = caldav_http("REPORT", href, username, password, body, {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"})
-    if status in (403, 409, 412):
-        remember_sync_state(state, calendar_id, supported=True, token="", ctag=ctag)
-        sync_log("sync-6578-reset", calendarId=calendar_id, status=status, ifChanged=if_changed)
-        return "eds", [], []
-    if status in (415, 501):
-        mark_sync_unsupported(state, calendar_id)
-        if if_changed:
-            return ctag_decision(state, calendar_id, ctag, True), [], []
-        return "eds", [], []
-    if status not in (200, 207):
-        return (("unchanged", [], []) if if_changed else ("eds", [], []))
-    try:
-        next_token, changed, removed, truncated = parse_sync_collection(payload, href)
-    except ET.ParseError:
-        return "eds", [], []
-    remote_uids = [str(uid) for uid in removed if uid]
-    remote_uids.extend(str(item.get("uid") or "") for item in changed if item.get("uid"))
+    deadline = time.monotonic() + CALDAV_SYNC_SECONDS
+    budget = [0]
+    cursor = token
+    seen_tokens = {token} if token else set()
+    metadata_only = False
+    working_events = [] if replace else list(cached_events)
+    remote_uids = []
+    removed_uids = []
+    changed_count = 0
+    removed_count = 0
+    final_token = ""
+    parse_client = client
+    drop_uids = deleted_touch_keys(cache, calendar_id)
+
+    def incomplete(reason: str, **fields) -> tuple[str, list, list]:
+        sync_log("sync-6578-incomplete", calendarId=calendar_id, reason=reason, requests=budget[0], **fields)
+        mode = "unchanged" if if_changed or cached_events else "eds"
+        return mode, [], remote_uids
+
+    for page in range(MAX_CALDAV_SYNC_PAGES):
+        limited = True
+        while True:
+            body = sync_report_body(cursor, include_calendar_data=not metadata_only, limited=limited)
+            try:
+                status, payload, _headers = budgeted_caldav_http(
+                    budget,
+                    deadline,
+                    "REPORT",
+                    href,
+                    username,
+                    password,
+                    body,
+                    {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+                )
+            except CaldavResponseTooLarge:
+                if not metadata_only:
+                    metadata_only = True
+                    sync_log("sync-6578-metadata-retry", calendarId=calendar_id, page=page + 1)
+                    continue
+                return incomplete("response-too-large", page=page + 1)
+            if limited and status in (400, 415, 501, 507):
+                limited = False
+                sync_log("sync-6578-limit-rejected", calendarId=calendar_id, status=status)
+                continue
+            break
+
+        if status in (403, 409, 412):
+            if token:
+                remember_sync_state(state, calendar_id, supported=True, token="", ctag=ctag)
+            sync_log("sync-6578-reset", calendarId=calendar_id, status=status, ifChanged=if_changed)
+            return "eds", [], remote_uids
+        if status in (415, 501):
+            mark_sync_unsupported(state, calendar_id)
+            if if_changed:
+                return ctag_decision(state, calendar_id, ctag, True), [], remote_uids
+            return "eds", [], remote_uids
+        if status not in (200, 207):
+            return incomplete("http", status=status, page=page + 1)
+        try:
+            next_token, changed, removed_items, truncated = parse_dav_items(payload, href)
+        except ET.ParseError:
+            return incomplete("invalid-xml", page=page + 1)
+
+        removed = [item["uid"] for item in removed_items]
+        changed_count += len(changed)
+        removed_count += len(removed)
+        if changed_count + removed_count > MAX_EVENTS:
+            return incomplete("item-limit", items=changed_count + removed_count)
+        remote_uids.extend(removed)
+        remote_uids.extend(str(item.get("uid") or "") for item in changed if item.get("uid"))
+
+        hydrated, vanished, fetch_failures = hydrate_changed_items(href, changed, username, password, budget, deadline)
+        removed.extend(vanished)
+        removed_uids.extend(removed)
+        if fetch_failures:
+            return incomplete("resource-fetch", failed=fetch_failures[:8])
+        if hydrated and parse_client is None and source is not None:
+            try:
+                parse_client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 10, None)
+            except Exception:
+                parse_client = None
+        new_events, failed_uids = ingest_changed_items(hydrated, calendar, parse_client, modules, window_start, window_end, username, password)
+        if failed_uids:
+            return incomplete("parse", failed=failed_uids[:8])
+        remote_uids.extend(str(event.get("uid") or "") for event in new_events if event.get("uid"))
+        replaced = removed + [str(item.get("uid") or "") for item in hydrated if item.get("uid")]
+        working_events = apply_sync_delta(working_events, replaced, new_events, drop_uids=drop_uids)
+        if len(working_events) > MAX_EVENTS:
+            return incomplete("expanded-event-limit", events=len(working_events))
+
+        if not next_token:
+            return incomplete("missing-token", page=page + 1)
+        if not truncated:
+            final_token = next_token
+            break
+        if next_token in seen_tokens:
+            return incomplete("repeated-token", page=page + 1)
+        seen_tokens.add(next_token)
+        cursor = next_token
+        sync_log("sync-6578-page", calendarId=calendar_id, page=page + 1, changed=len(changed), removed=len(removed))
+    else:
+        return incomplete("page-limit", pages=MAX_CALDAV_SYNC_PAGES)
+
+    remote_uids = list(dict.fromkeys(uid for uid in remote_uids if uid))
+    remember_sync_state(state, calendar_id, supported=True, token=final_token, ctag=ctag or final_token, filled=True)
     if cache is not None:
         removed_map = cache.get("_removed") if isinstance(cache.get("_removed"), dict) else {}
-        removed_map[calendar_id] = [str(uid) for uid in removed if uid]
+        removed_map[calendar_id] = list(dict.fromkeys(uid for uid in removed_uids if uid))
         cache["_removed"] = removed_map
-    if truncated:
-        sync_log("sync-6578-truncated", calendarId=calendar_id, token=token)
-        return (("unchanged", [], remote_uids) if if_changed else ("eds", [], remote_uids))
-    parse_client = client
-    if changed and parse_client is None and source is not None:
-        try:
-            parse_client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 10, None)
-        except Exception:
-            parse_client = None
-    new_events, failed_uids = ingest_changed_items(changed, calendar, parse_client, modules, window_start, window_end, username, password)
-    remote_uids.extend(str(event.get("uid") or "") for event in new_events if event.get("uid"))
-    drop_uids = deleted_touch_keys(cache, calendar_id)
-    failed_keep = [uid for uid in failed_uids if uid not in drop_uids]
-    if failed_uids:
-        sync_log("sync-6578-parse-failed", calendarId=calendar_id, failed=failed_uids[:8], changed=len(changed))
-        if replace:
-            return (("unchanged", [], remote_uids) if if_changed else ("eds", [], remote_uids))
-        return "updated", apply_sync_delta(cached_events, removed, new_events, keep_uids=failed_keep, drop_uids=drop_uids), remote_uids
-    if next_token:
-        remember_sync_state(state, calendar_id, supported=True, token=next_token, ctag=ctag or next_token, filled=True)
-        if cache is not None:
-            cache["syncState"] = state
+        cache["syncState"] = state
     if replace:
-        sync_log("sync-6578-full", calendarId=calendar_id, pulled=len(new_events), token=next_token or token)
-        return "updated", new_events, remote_uids
-    if not changed and not removed:
-        sync_log("sync-6578-unchanged", calendarId=calendar_id, token=next_token or token)
+        sync_log("sync-6578-full", calendarId=calendar_id, pulled=len(working_events), token=final_token, pages=len(seen_tokens) or 1)
+        return "updated", working_events, remote_uids
+    if not changed_count and not removed_count:
+        sync_log("sync-6578-unchanged", calendarId=calendar_id, token=final_token)
         return "unchanged", [], remote_uids
-    merged = apply_sync_delta(cached_events, removed, new_events, keep_uids=failed_keep, drop_uids=drop_uids)
-    sync_log("sync-6578-updated", calendarId=calendar_id, changed=len(changed), removed=removed, token=next_token or token)
-    return "updated", merged, remote_uids
+    sync_log("sync-6578-updated", calendarId=calendar_id, changed=changed_count, removed=removed_count, token=final_token)
+    return "updated", working_events, remote_uids
 
 
 def caldav_sync_calendar(source, registry, modules: EdsModules, calendar: dict, client, cache: dict | None, window_start: datetime, window_end: datetime, if_changed: bool = False) -> tuple[str, list, list]:
@@ -1486,7 +1926,7 @@ def caldav_sync_calendar(source, registry, modules: EdsModules, calendar: dict, 
     if current.get("supported") is True and token:
         pass
     else:
-        status, body, _headers = caldav_http("PROPFIND", href, username, password, SYNC_PROBE_BODY, {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"})
+        status, body, _headers = caldav_http("PROPFIND", href, username, password, SYNC_PROBE_BODY, {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"}, timeout=10.0)
         supported, probed_token, ctag = parse_sync_probe(body) if status in (200, 207) else (False, "", "")
         if cache is not None:
             cache["syncState"] = state
