@@ -541,6 +541,16 @@ Panel {
     return !!(event && (event.recurring === true || event.rid))
   }
 
+  function contextTask() {
+    if (!root.contextEvent || !calendarService) return null
+    if (String(root.contextEvent.id || "").indexOf("task:") !== 0) return null
+    var list = calendarService.tasks || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].uid === root.contextEvent.uid) return list[i]
+    }
+    return null
+  }
+
   function handleEventClick(event, mouse, item) {
     if (!event || event.status === "saving") return
     if (eventMenu.opened) {
@@ -1632,6 +1642,16 @@ Panel {
             }
           }
           EventMenuItem {
+            visible: root.contextTask() !== null
+            text: root.contextTask() && root.contextTask().completed ? "Mark as not completed" : "Mark as completed"
+            onClicked: {
+              var task = root.contextTask()
+              root.closeEventMenu()
+              if (task && calendarService) calendarService.toggleTaskComplete(task)
+            }
+          }
+          EventMenuItem {
+            visible: root.contextTask() === null
             text: root.eventIsRecurring(root.contextEvent) ? "Edit this event" : "Edit"
             onClicked: {
               var event = root.contextEvent
@@ -1640,7 +1660,7 @@ Panel {
             }
           }
           EventMenuItem {
-            visible: root.eventIsRecurring(root.contextEvent)
+            visible: root.contextTask() === null && root.eventIsRecurring(root.contextEvent)
             text: "Edit all events"
             onClicked: {
               var event = root.contextEvent
@@ -1649,6 +1669,16 @@ Panel {
             }
           }
           EventMenuItem {
+            visible: root.contextTask() !== null
+            text: "Delete task"
+            onClicked: {
+              var task = root.contextTask()
+              root.closeEventMenu()
+              if (task && calendarService) calendarService.deleteTask(task)
+            }
+          }
+          EventMenuItem {
+            visible: root.contextTask() === null
             text: root.eventIsRecurring(root.contextEvent) ? "Remove this event" : "Remove"
             onClicked: {
               var event = root.contextEvent
