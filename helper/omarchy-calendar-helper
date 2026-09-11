@@ -796,6 +796,7 @@ def component_task(component, calendar: dict, modules: EdsModules, client=None) 
     return {
         "id": ":".join(part for part in [calendar["id"], uid] if part),
         "uid": uid,
+        "rid": "",
         "calendarId": calendar["id"],
         "calendarName": calendar["name"],
         "calendarColor": calendar["color"],
@@ -807,13 +808,58 @@ def component_task(component, calendar: dict, modules: EdsModules, client=None) 
         "status": status,
         "completed": status == "COMPLETED",
         "percentComplete": int(percent) if percent is not None and percent >= 0 else 0,
-        "priority": int(priority) if priority else 0,
+        "priority": int(priority) if priority and priority > 0 else 0,
+        "rrule": extract_rrule(component),
+        "recurring": bool(hasattr(component, "has_recurrences") and component.has_recurrences()),
         "provider": calendar["provider"],
         "source": calendar["source"],
     }
 
 
-def task_component_from_fields(modules: EdsModules, uid: str, title: str, due: datetime | None, all_day: bool, description: str, status: str = "NEEDS-ACTION", percent_complete: int = 0, priority: int = 0) -> object:
+def append_component_tasks(client, component, calendar: dict, window_start: datetime, window_end: datetime, tasks: list, modules: EdsModules) -> None:
+    base = component_task(component, calendar, modules, client)
+    if not base["uid"]:
+        return
+    if not base["recurring"]:
+        tasks.append(base)
+        return
+    ical = component.get_icalcomponent() if hasattr(component, "get_icalcomponent") else None
+    if ical is None:
+        tasks.append(base)
+        return
+    collected = []
+
+    def cb(_icomp, instance_start, _instance_end, _user_data, _cancellable=None):
+        if len(tasks) + len(collected) >= MAX_EVENTS:
+            return False
+        due, all_day = ical_time_iso(instance_start, modules, client)
+        if not due:
+            return True
+        task = dict(base)
+        task["due"] = due
+        task["allDay"] = bool(base["allDay"] or all_day)
+        rid = iso_to_rid(due, task["allDay"])
+        task["rid"] = rid
+        task["id"] = ":".join(part for part in [task["calendarId"], task["uid"], rid or due] if part)
+        collected.append(task)
+        return True
+
+    try:
+        client.generate_instances_for_object_sync(
+            ical,
+            int(window_start.timestamp()),
+            int(window_end.timestamp()),
+            None,
+            cb,
+            None,
+        )
+    except Exception:
+        tasks.append(base)
+        return
+    tasks.extend(collected if collected else [base])
+
+
+def task_component_from_fields(modules: EdsModules, uid: str, title: str, due: datetime | None, all_day: bool, description: str, status: str = "NEEDS-ACTION", percent_complete: int = 0, priority: int = 0, rrule: str = "") -> object:
     now = datetime.now(UTC)
     lines = [
         "BEGIN:VTODO",
@@ -831,6 +877,8 @@ def task_component_from_fields(modules: EdsModules, uid: str, title: str, due: d
         lines.append(f"DESCRIPTION:{ics_escape(description)}")
     if priority:
         lines.append(f"PRIORITY:{int(priority)}")
+    if rrule:
+        lines.append(f"RRULE:{rrule}")
     if status == "COMPLETED":
         lines.append(f"COMPLETED:{ics_datetime(now, False)}")
     lines.append("END:VTODO")
@@ -863,6 +911,9 @@ def eds_client_for_tasklist(calendar_id: str):
 def eds_list_tasks() -> list:
     modules = load_eds_modules()
     registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    now = datetime.now(UTC)
+    window_start = now - timedelta(days=60)
+    window_end = now + timedelta(days=180)
     tasks: list = []
     for source in registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_TASK_LIST):
         if not registry.check_enabled(source):
@@ -878,18 +929,18 @@ def eds_list_tasks() -> list:
         for component in components or []:
             if len(tasks) >= MAX_EVENTS:
                 break
-            task = component_task(component, calendar, modules, client)
-            if task["uid"]:
-                tasks.append(task)
+            if not (component.get_uid() or ""):
+                continue
+            append_component_tasks(client, component, calendar, window_start, window_end, tasks, modules)
     return tasks
 
 
-def eds_create_task(calendar_id: str, title: str, due: datetime | None, all_day: bool, description: str, priority: int = 0) -> dict:
+def eds_create_task(calendar_id: str, title: str, due: datetime | None, all_day: bool, description: str, priority: int = 0, rrule: str = "") -> dict:
     modules, registry, source, client = eds_client_for_tasklist(calendar_id)
     if client.is_readonly():
         raise ValueError(f"Task list is read-only: {source.get_display_name()}")
     uid = f"omarchy-calendar-{uuid4()}"
-    ical = task_component_from_fields(modules, uid, title, due, all_day, description, "NEEDS-ACTION", 0, priority)
+    ical = task_component_from_fields(modules, uid, title, due, all_day, description, "NEEDS-ACTION", 0, priority, normalize_rrule(rrule))
     ok, created_uid = client.create_object_sync(ical, modules.ECal.OperationFlags.DISABLE_ITIP_MESSAGE, None)
     if not ok:
         raise ValueError("EDS create_object_sync returned false.")
@@ -900,13 +951,13 @@ def eds_create_task(calendar_id: str, title: str, due: datetime | None, all_day:
     return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "task": task, "uid": created_uid or uid}
 
 
-def eds_update_task(calendar_id: str, uid: str, title: str, due: datetime | None, all_day: bool, description: str, status: str = "NEEDS-ACTION", percent_complete: int = 0, priority: int = 0) -> dict:
+def eds_update_task(calendar_id: str, uid: str, title: str, due: datetime | None, all_day: bool, description: str, status: str = "NEEDS-ACTION", percent_complete: int = 0, priority: int = 0, rrule: str = "") -> dict:
     if not uid:
         raise ValueError("update-task requires --uid.")
     modules, registry, source, client = eds_client_for_tasklist(calendar_id)
     if client.is_readonly():
         raise ValueError(f"Task list is read-only: {source.get_display_name()}")
-    ical = task_component_from_fields(modules, uid, title, due, all_day, description, status, percent_complete, priority)
+    ical = task_component_from_fields(modules, uid, title, due, all_day, description, status, percent_complete, priority, normalize_rrule(rrule))
     ok = client.modify_object_sync(ical, modules.ECal.ObjModType.ALL, modules.ECal.OperationFlags.DISABLE_ITIP_MESSAGE, None)
     if not ok:
         raise ValueError("EDS modify_object_sync returned false.")
@@ -2427,11 +2478,11 @@ def main(argv: list[str]) -> int:
                 return emit_json({"ok": True, "provider": "evolution-data-server", "tasks": eds_list_tasks()})
             due = parse_instant(args.due) if args.due else None
             if args.operation == "create-task":
-                return emit_json(eds_create_task(args.calendar_id, args.title, due, args.all_day, args.description, args.priority))
+                return emit_json(eds_create_task(args.calendar_id, args.title, due, args.all_day, args.description, args.priority, args.rrule))
             if args.operation == "update-task":
                 if not args.uid:
                     raise ValueError("update-task requires --uid.")
-                return emit_json(eds_update_task(args.calendar_id, args.uid, args.title, due, args.all_day, args.description, args.status, args.percent_complete, args.priority))
+                return emit_json(eds_update_task(args.calendar_id, args.uid, args.title, due, args.all_day, args.description, args.status, args.percent_complete, args.priority, args.rrule))
             if args.operation == "delete-task":
                 if not args.uid:
                     raise ValueError("delete-task requires --uid.")

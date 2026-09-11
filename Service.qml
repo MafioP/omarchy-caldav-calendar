@@ -183,24 +183,26 @@ Item {
     for (var i = 0; i < list.length; i++) {
       var task = list[i]
       if (!task || !task.due) continue
-      var startKey = String(task.due).slice(0, 10)
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(startKey)) continue
+      var isAllDay = task.allDay === true
+      var startVal = isAllDay ? String(task.due).slice(0, 10) : String(task.due)
+      if (isAllDay && !/^\d{4}-\d{2}-\d{2}$/.test(startVal)) continue
       out.push({
-        id: "task:" + task.id,
+        id: "task:" + task.id + (task.rid ? ":" + task.rid : ""),
         uid: task.uid,
+        rid: task.rid || "",
         calendarId: task.calendarId,
         calendarName: task.calendarName,
         calendarColor: task.calendarColor,
         title: (task.completed ? "☑ " : "☐ ") + task.title,
         location: "",
         description: task.description || "",
-        start: startKey,
-        end: Model.nextDateKey(startKey),
-        allDay: true,
+        start: startVal,
+        end: isAllDay ? Model.nextDateKey(startVal) : startVal,
+        allDay: isAllDay,
         status: task.pending === true ? "saving" : (task.status || ""),
         meetingUrl: "",
         meetingProvider: "",
-        recurring: false,
+        recurring: task.recurring === true,
         provider: task.provider,
         source: task.source,
         isTask: true
@@ -714,7 +716,7 @@ Item {
     listTasksProc.running = true
   }
 
-  function optimisticTask(calendarId, id, uid, title, dueKey, allDay, description, priority, status, percentComplete) {
+  function optimisticTask(calendarId, id, uid, title, dueKey, allDay, description, priority, status, percentComplete, rrule) {
     var cal = calendarById(calendarId) || {}
     return {
       id: id,
@@ -730,19 +732,21 @@ Item {
       completed: status === "COMPLETED",
       percentComplete: percentComplete || 0,
       priority: priority || 0,
+      rrule: rrule || "",
+      recurring: !!rrule,
       provider: "caldav",
       source: "Evolution Data Server",
       pending: true
     }
   }
 
-  function createTask(calendarId, title, dueIso, allDay, description, priority) {
+  function createTask(calendarId, title, dueIso, allDay, description, priority, rrule) {
     taskStatus = "saving"
     taskErrorMessage = ""
     if (createTaskProc.running) createTaskProc.running = false
     var destId = calendarId || defaultWritableCalendarId()
     var pendingId = "omarchy-task-pending-" + Date.now()
-    tasks = tasks.concat([optimisticTask(destId, pendingId, "", title, dueIso, allDay, description, priority, "NEEDS-ACTION", 0)])
+    tasks = tasks.concat([optimisticTask(destId, pendingId, "", title, dueIso, allDay, description, priority, "NEEDS-ACTION", 0, rrule)])
     showActiveRange()
     createTaskProc.command = [
       helperPath(), "create-task",
@@ -751,13 +755,14 @@ Item {
       "--title", String(title || "(No title)"),
       "--due", String(dueIso || ""),
       "--description", String(description || ""),
-      "--priority", String(priority || 0)
+      "--priority", String(priority || 0),
+      "--rrule", String(rrule || "")
     ]
     if (allDay) createTaskProc.command.push("--all-day")
     createTaskProc.running = true
   }
 
-  function updateTask(task, title, dueIso, allDay, description, status, percentComplete, priority) {
+  function updateTask(task, title, dueIso, allDay, description, status, percentComplete, priority, rrule) {
     if (!task || !task.uid) {
       root.taskSaved(false, "Could not save the task.")
       return
@@ -765,9 +770,10 @@ Item {
     taskStatus = "saving"
     taskErrorMessage = ""
     if (updateTaskProc.running) updateTaskProc.running = false
+    var effectiveRrule = rrule !== undefined ? rrule : (task.rrule || "")
     tasks = tasks.map(function(t) {
       if (t.id !== task.id) return t
-      return optimisticTask(t.calendarId, t.id, t.uid, title, dueIso, allDay, description, priority, status, percentComplete)
+      return optimisticTask(t.calendarId, t.id, t.uid, title, dueIso, allDay, description, priority, status, percentComplete, effectiveRrule)
     })
     showActiveRange()
     updateTaskProc.command = [
@@ -778,6 +784,7 @@ Item {
       "--title", String(title || "(No title)"),
       "--due", String(dueIso || ""),
       "--description", String(description || ""),
+      "--rrule", String(effectiveRrule || ""),
       "--status", String(status || "NEEDS-ACTION"),
       "--percent-complete", String(percentComplete || 0),
       "--priority", String(priority || 0)

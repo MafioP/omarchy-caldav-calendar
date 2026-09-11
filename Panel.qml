@@ -545,8 +545,16 @@ Panel {
     if (!root.contextEvent || !calendarService) return null
     if (String(root.contextEvent.id || "").indexOf("task:") !== 0) return null
     var list = calendarService.tasks || []
-    for (var i = 0; i < list.length; i++) {
-      if (list[i] && list[i].uid === root.contextEvent.uid) return list[i]
+    var wantRid = root.contextEvent.rid || ""
+    // Prefer the exact occurrence that was clicked (matters for recurring
+    // tasks, where several instances share the same uid but different rid).
+    if (wantRid) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].uid === root.contextEvent.uid && list[i].rid === wantRid) return list[i]
+      }
+    }
+    for (var j = 0; j < list.length; j++) {
+      if (list[j] && list[j].uid === root.contextEvent.uid) return list[j]
     }
     return null
   }
@@ -739,7 +747,13 @@ Panel {
         createError = "No writable calendar is available."
         return
       }
-      calendarService.createTask(taskCalendarId, titleField.text, createDateKey, true, "", 0)
+      var dueIso = createAllDay ? createDateKey : Model.dateTimeIso(createDateKey, createStartTime)
+      if (!dueIso) {
+        createError = "Choose a date."
+        return
+      }
+      var taskRrule = Model.serializeRecurrence(root.createRecurrence)
+      calendarService.createTask(taskCalendarId, titleField.text, dueIso, createAllDay, "", 0, taskRrule)
       creatingEvent = false
       createIsTask = false
       createError = ""
@@ -1048,7 +1062,6 @@ Panel {
                     }
                   }
                   Column {
-                    visible: !root.createIsTask
                     spacing: Style.space(4)
                     Text {
                       text: "All day"
@@ -1063,8 +1076,8 @@ Panel {
                     }
                   }
                   TimePicker {
-                    visible: !root.createAllDay && !root.createIsTask
-                    label: "Start"
+                    visible: !root.createAllDay
+                    label: root.createIsTask ? "Time" : "Start"
                     value: root.createStartTime
                     onChanged: function(value) { root.createStartTime = value }
                   }
