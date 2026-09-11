@@ -3061,6 +3061,24 @@ Panel {
             }
           }
 
+          Rectangle {
+            visible: taskRow.modelData.recurring === true
+            width: Style.space(26)
+            height: Style.space(26)
+            radius: Style.cornerRadius
+            anchors.verticalCenter: parent.verticalCenter
+            color: Util.alpha(Color.accent, 0.2)
+            border.color: Color.accent
+            border.width: 1
+            Text {
+              anchors.centerIn: parent
+              text: "↻"
+              color: Color.accent
+              font.bold: true
+              font.pixelSize: Style.font.body
+            }
+          }
+
           Column {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
@@ -3073,7 +3091,7 @@ Panel {
             }
             Text {
               visible: !!taskRow.modelData.due
-              text: (taskRow.modelData.due ? String(taskRow.modelData.due).slice(0, 10) : "") + (taskRow.modelData.recurring ? " ↻" : "")
+              text: taskRow.modelData.due ? String(taskRow.modelData.due).slice(0, 10) : ""
               color: Color.muted
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption - 1
