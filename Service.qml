@@ -177,10 +177,42 @@ Item {
     refreshed()
   }
 
+  function taskEventShapes() {
+    var out = []
+    var list = root.tasks || []
+    for (var i = 0; i < list.length; i++) {
+      var task = list[i]
+      if (!task || !task.due) continue
+      var startKey = String(task.due).slice(0, 10)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(startKey)) continue
+      out.push({
+        id: "task:" + task.id,
+        uid: task.uid,
+        calendarId: task.calendarId,
+        calendarName: task.calendarName,
+        calendarColor: task.calendarColor,
+        title: (task.completed ? "☑ " : "☐ ") + task.title,
+        location: "",
+        description: task.description || "",
+        start: startKey,
+        end: Model.nextDateKey(startKey),
+        allDay: true,
+        status: task.status || "",
+        meetingUrl: "",
+        meetingProvider: "",
+        recurring: false,
+        provider: task.provider,
+        source: task.source,
+        isTask: true
+      })
+    }
+    return out
+  }
+
   function showActiveRange() {
     root.calendars = root.cachedCalendars
     root.events = Model.eventsInRange(root.cachedEvents, root.activeStart, root.activeEnd)
-    root.eventsByDay = Model.eventsByDay(root.events)
+    root.eventsByDay = Model.eventsByDay(root.events.concat(root.taskEventShapes()))
     root.refreshed()
   }
 
@@ -754,6 +786,7 @@ Item {
     }
     tasks = payload.tasks || []
     taskStatus = "idle"
+    root.showActiveRange()
     root.tasksRefreshed()
   }
 
