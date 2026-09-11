@@ -45,10 +45,19 @@ Item {
   readonly property int maxHelperBytes: 8 * 1024 * 1024
   readonly property int maxHelperErrorBytes: 64 * 1024
 
+  // Tasks (VTODO) support: intentionally simple compared to the events path
+  // above (no optimistic UI, no cache/delta sync) — every mutation just
+  // refetches the full task list from EDS afterward.
+  property var tasks: []
+  property string taskStatus: "idle"
+  property string taskErrorMessage: ""
+
   signal refreshed()
   signal eventCreated(var event)
   signal eventSaved(bool ok, string message)
   signal setupFinished(bool ok, string message)
+  signal tasksRefreshed()
+  signal taskSaved(bool ok, string message)
 
   function helperPath() {
     return decodeURIComponent(Qt.resolvedUrl("helper/omarchy-calendar-helper").toString().replace(/^file:\/\//, ""))
@@ -667,6 +676,101 @@ Item {
     updateProc.running = true
   }
 
+  function refreshTasks() {
+    if (listTasksProc.running) listTasksProc.running = false
+    listTasksProc.command = [helperPath(), "list-tasks", "--provider", "evolution-data-server"]
+    listTasksProc.running = true
+  }
+
+  function createTask(calendarId, title, dueIso, allDay, description, priority) {
+    taskStatus = "saving"
+    taskErrorMessage = ""
+    if (createTaskProc.running) createTaskProc.running = false
+    createTaskProc.command = [
+      helperPath(), "create-task",
+      "--provider", "evolution-data-server",
+      "--calendar-id", String(calendarId || defaultWritableCalendarId()),
+      "--title", String(title || "(No title)"),
+      "--due", String(dueIso || ""),
+      "--description", String(description || ""),
+      "--priority", String(priority || 0)
+    ]
+    if (allDay) createTaskProc.command.push("--all-day")
+    createTaskProc.running = true
+  }
+
+  function updateTask(task, title, dueIso, allDay, description, status, percentComplete, priority) {
+    if (!task || !task.uid) {
+      root.taskSaved(false, "Could not save the task.")
+      return
+    }
+    taskStatus = "saving"
+    taskErrorMessage = ""
+    if (updateTaskProc.running) updateTaskProc.running = false
+    updateTaskProc.command = [
+      helperPath(), "update-task",
+      "--provider", "evolution-data-server",
+      "--calendar-id", String(task.calendarId || ""),
+      "--uid", String(task.uid || ""),
+      "--title", String(title || "(No title)"),
+      "--due", String(dueIso || ""),
+      "--description", String(description || ""),
+      "--status", String(status || "NEEDS-ACTION"),
+      "--percent-complete", String(percentComplete || 0),
+      "--priority", String(priority || 0)
+    ]
+    if (allDay) updateTaskProc.command.push("--all-day")
+    updateTaskProc.running = true
+  }
+
+  function toggleTaskComplete(task) {
+    if (!task) return
+    var nowComplete = task.status !== "COMPLETED"
+    updateTask(task, task.title, task.due, task.allDay, task.description,
+      nowComplete ? "COMPLETED" : "NEEDS-ACTION", nowComplete ? 100 : 0, task.priority)
+  }
+
+  function deleteTask(task) {
+    if (!task || !task.uid) return
+    taskStatus = "saving"
+    taskErrorMessage = ""
+    if (deleteTaskProc.running) deleteTaskProc.running = false
+    deleteTaskProc.command = [
+      helperPath(), "delete-task",
+      "--provider", "evolution-data-server",
+      "--calendar-id", String(task.calendarId || ""),
+      "--uid", String(task.uid || "")
+    ]
+    deleteTaskProc.running = true
+  }
+
+  function finishListTasks(text, exitCode) {
+    var payload = null
+    try { payload = JSON.parse(text || "{}") } catch (e) { payload = null }
+    if (!payload || payload.ok !== true) {
+      taskErrorMessage = failMessage(payload, "Could not load tasks.")
+      taskStatus = "error"
+      return
+    }
+    tasks = payload.tasks || []
+    taskStatus = "idle"
+    root.tasksRefreshed()
+  }
+
+  function finishTaskMutation(text, exitCode, label) {
+    var payload = null
+    try { payload = JSON.parse(text || "{}") } catch (e) { payload = null }
+    if (!payload || payload.ok !== true) {
+      taskErrorMessage = failMessage(payload, "Could not " + label + " the task.")
+      taskStatus = "error"
+      root.taskSaved(false, taskErrorMessage)
+      return
+    }
+    taskStatus = "idle"
+    root.taskSaved(true, "")
+    refreshTasks()
+  }
+
   function applyCalendarAppearance(names, colors) {
     names = names || {}
     colors = colors || {}
@@ -1020,7 +1124,10 @@ Item {
     onTriggered: root.checkReminders()
   }
 
-  Component.onCompleted: root.bootReminders()
+  Component.onCompleted: {
+    root.bootReminders()
+    root.refreshTasks()
+  }
 
   Timer {
     id: setupTimeout
@@ -1056,6 +1163,46 @@ Item {
       root.setupStatus = ""
       root.refreshed()
       root.runPendingSnapshot()
+    }
+  }
+
+  Process {
+    id: listTasksProc
+    running: false
+    stdout: StdioCollector { id: listTasksOut; waitForEnd: true }
+    stderr: StdioCollector { id: listTasksErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishListTasks(root.helperText(listTasksOut.text, listTasksErr.text), exitCode)
+    }
+  }
+
+  Process {
+    id: createTaskProc
+    running: false
+    stdout: StdioCollector { id: createTaskOut; waitForEnd: true }
+    stderr: StdioCollector { id: createTaskErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishTaskMutation(root.helperText(createTaskOut.text, createTaskErr.text), exitCode, "create")
+    }
+  }
+
+  Process {
+    id: updateTaskProc
+    running: false
+    stdout: StdioCollector { id: updateTaskOut; waitForEnd: true }
+    stderr: StdioCollector { id: updateTaskErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishTaskMutation(root.helperText(updateTaskOut.text, updateTaskErr.text), exitCode, "update")
+    }
+  }
+
+  Process {
+    id: deleteTaskProc
+    running: false
+    stdout: StdioCollector { id: deleteTaskOut; waitForEnd: true }
+    stderr: StdioCollector { id: deleteTaskErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishTaskMutation(root.helperText(deleteTaskOut.text, deleteTaskErr.text), exitCode, "delete")
     }
   }
 }

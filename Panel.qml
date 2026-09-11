@@ -861,6 +861,7 @@ Panel {
                 ViewButton { text: "Week"; selected: root.viewMode === "week"; onClicked: root.setView("week"); onDoubleClicked: { root.setView("week"); root.goToToday() } }
                 ViewButton { text: "Work week"; selected: root.viewMode === "work-week"; onClicked: root.setView("work-week"); onDoubleClicked: { root.setView("work-week"); root.goToToday() } }
                 ViewButton { text: "Day"; selected: root.viewMode === "day"; onClicked: root.setView("day"); onDoubleClicked: { root.setView("day"); root.goToToday() } }
+                ViewButton { text: "Tasks"; selected: root.viewMode === "tasks"; onClicked: { root.setView("tasks"); calendarService.refreshTasks() } }
               }
 
               Item {
@@ -1539,7 +1540,7 @@ Panel {
               spacing: Style.space(12)
               Item {
                 width: dayPanel.visible ? parent.width - dayPanel.width - parent.spacing : parent.width
-                height: root.viewMode === "month" ? monthViewRoot.height : timeGridRoot.height
+                height: root.viewMode === "month" ? monthViewRoot.height : (root.viewMode === "tasks" ? tasksViewRoot.height : timeGridRoot.height)
                 MonthView {
                   id: monthViewRoot
                   visible: root.viewMode === "month"
@@ -1547,7 +1548,12 @@ Panel {
                 }
                 TimeGridView {
                   id: timeGridRoot
-                  visible: root.viewMode !== "month"
+                  visible: root.viewMode !== "month" && root.viewMode !== "tasks"
+                  width: parent.width
+                }
+                TasksView {
+                  id: tasksViewRoot
+                  visible: root.viewMode === "tasks"
                   width: parent.width
                 }
               }
@@ -2764,6 +2770,244 @@ Panel {
       }
     }
 
+  }
+
+  component TasksView: Column {
+    id: tasksView
+    spacing: Style.space(10)
+
+    property var editingTask: null
+    property bool creating: false
+    property string formDueKey: ""
+
+    function startCreate() {
+      editingTask = null
+      creating = true
+      formTitleField.text = ""
+      formDueKey = root.todayKey
+      formDescriptionField.text = ""
+      formPriorityField.text = ""
+    }
+
+    function startEdit(task) {
+      creating = false
+      editingTask = task
+      formTitleField.text = task.title || ""
+      formDueKey = task.due ? String(task.due).slice(0, 10) : root.todayKey
+      formDescriptionField.text = task.description || ""
+      formPriorityField.text = task.priority ? String(task.priority) : ""
+    }
+
+    function closeForm() {
+      creating = false
+      editingTask = null
+    }
+
+    function commit() {
+      if (!calendarService) return
+      var priorityNum = formPriorityField.text ? parseInt(formPriorityField.text, 10) : 0
+      if (isNaN(priorityNum)) priorityNum = 0
+      var titleText = formTitleField.text
+      var descriptionText = formDescriptionField.text
+      if (editingTask) {
+        calendarService.updateTask(editingTask, titleText, formDueKey, true, descriptionText,
+          editingTask.status || "NEEDS-ACTION", editingTask.percentComplete || 0, priorityNum)
+      } else {
+        calendarService.createTask(calendarService.defaultWritableCalendarId(), titleText, formDueKey, true, descriptionText, priorityNum)
+      }
+      closeForm()
+    }
+
+    Row {
+      width: parent.width
+      spacing: Style.space(8)
+      Text {
+        text: "Tasks"
+        color: Color.foreground
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.body
+        font.bold: true
+      }
+      Item { width: Style.space(1); height: 1 }
+      Rectangle {
+        width: addTaskLabel.implicitWidth + Style.space(16)
+        height: Style.space(26)
+        radius: Style.cornerRadius
+        color: Util.alpha(Color.accent, tasksView.creating ? 0.3 : 0.16)
+        border.color: Color.accent
+        border.width: 1
+        Text {
+          id: addTaskLabel
+          anchors.centerIn: parent
+          text: "+ Add task"
+          color: Color.accent
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+        MouseArea {
+          anchors.fill: parent
+          onClicked: tasksView.creating ? tasksView.closeForm() : tasksView.startCreate()
+        }
+      }
+    }
+
+    Rectangle {
+      visible: tasksView.creating || tasksView.editingTask !== null
+      width: parent.width
+      height: formColumn.implicitHeight + Style.space(20)
+      radius: Style.cornerRadius
+      color: Util.alpha(Color.foreground, 0.06)
+      border.color: Color.accent
+      border.width: 1
+
+      Column {
+        id: formColumn
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: Style.space(10)
+        spacing: Style.space(8)
+
+        TextField {
+          id: formTitleField
+          width: parent.width
+          placeholderText: "Task title"
+          onAccepted: tasksView.commit()
+        }
+
+        Row {
+          spacing: Style.space(12)
+          DatePicker {
+            label: "Due"
+            value: tasksView.formDueKey || root.todayKey
+            onChanged: function(value) { tasksView.formDueKey = value }
+          }
+          TextField {
+            id: formPriorityField
+            width: Style.space(60)
+            placeholderText: "Priority"
+          }
+        }
+
+        TextField {
+          id: formDescriptionField
+          width: parent.width
+          placeholderText: "Description"
+        }
+
+        Row {
+          spacing: Style.space(8)
+          Rectangle {
+            width: Style.space(64)
+            height: Style.space(26)
+            radius: Style.cornerRadius
+            color: Color.accent
+            Text { anchors.centerIn: parent; text: "Save"; color: Color.background; font.pixelSize: Style.font.caption; font.bold: true }
+            MouseArea { anchors.fill: parent; onClicked: tasksView.commit() }
+          }
+          Rectangle {
+            width: Style.space(64)
+            height: Style.space(26)
+            radius: Style.cornerRadius
+            color: "transparent"
+            border.color: Color.muted
+            border.width: 1
+            Text { anchors.centerIn: parent; text: "Cancel"; color: Color.muted; font.pixelSize: Style.font.caption }
+            MouseArea { anchors.fill: parent; onClicked: tasksView.closeForm() }
+          }
+        }
+      }
+    }
+
+    Text {
+      visible: calendarService && calendarService.tasks && calendarService.tasks.length === 0
+      text: "No tasks yet."
+      color: Color.muted
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    Repeater {
+      model: calendarService ? calendarService.tasks : []
+      delegate: Rectangle {
+        id: taskRow
+        required property var modelData
+        width: tasksView.width
+        height: Style.space(40)
+        radius: Style.cornerRadius
+        color: Util.alpha(Color.foreground, 0.04)
+
+        Row {
+          anchors.left: parent.left
+          anchors.right: deleteBtn.left
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: Style.space(8)
+          spacing: Style.space(10)
+
+          Rectangle {
+            width: Style.space(18)
+            height: Style.space(18)
+            radius: 4
+            anchors.verticalCenter: parent.verticalCenter
+            color: taskRow.modelData.completed ? Color.accent : "transparent"
+            border.color: Color.accent
+            border.width: 1
+            Text {
+              anchors.centerIn: parent
+              visible: taskRow.modelData.completed
+              text: "✓"
+              color: Color.background
+              font.pixelSize: Style.font.caption
+            }
+            MouseArea {
+              anchors.fill: parent
+              onClicked: calendarService.toggleTaskComplete(taskRow.modelData)
+            }
+          }
+
+          Column {
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+            Text {
+              text: taskRow.modelData.title
+              color: taskRow.modelData.completed ? Color.muted : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.strikeout: taskRow.modelData.completed
+            }
+            Text {
+              visible: !!taskRow.modelData.due
+              text: taskRow.modelData.due ? String(taskRow.modelData.due).slice(0, 10) : ""
+              color: Color.muted
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption - 1
+            }
+          }
+
+          MouseArea {
+            width: Style.space(200)
+            height: parent.height
+            onClicked: tasksView.startEdit(taskRow.modelData)
+          }
+        }
+
+        Rectangle {
+          id: deleteBtn
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(22)
+          height: Style.space(22)
+          radius: Style.cornerRadius
+          color: "transparent"
+          Text { anchors.centerIn: parent; text: "×"; color: Color.muted; font.pixelSize: Style.font.body }
+          MouseArea {
+            anchors.fill: parent
+            onClicked: calendarService.deleteTask(taskRow.modelData)
+          }
+        }
+      }
+    }
   }
 
   component DayPanel: Rectangle {
