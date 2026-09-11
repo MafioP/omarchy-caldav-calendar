@@ -40,6 +40,7 @@ Panel {
   property string createStartTime: "09:00"
   property string createEndTime: "10:00"
   property bool createAllDay: false
+  property bool createIsTask: false
   property string createMeetingUrl: ""
   property string createMeetingKind: "none"
   property var createRecurrence: Model.defaultRecurrence(todayKey)
@@ -232,6 +233,7 @@ Panel {
     editScope = "all"
     createDateKey = selectedKey
     createAllDay = false
+    createIsTask = false
     createMeetingUrl = ""
     createMeetingKind = "none"
     createRecurrence = Model.defaultRecurrence(createDateKey)
@@ -260,6 +262,7 @@ Panel {
     if (last <= first) last = first + root.fixedEventDurationMinutes / 60
     root.createDateKey = dayKey
     root.createAllDay = false
+    root.createIsTask = false
     root.createMeetingUrl = ""
     root.createMeetingKind = "none"
     root.createError = ""
@@ -622,6 +625,7 @@ Panel {
     editingEvent = null
     createRecurrence = Model.defaultRecurrence(selectedKey)
     createAllDay = false
+    createIsTask = false
     createMeetingUrl = ""
     createMeetingKind = "none"
     createError = ""
@@ -639,6 +643,7 @@ Panel {
     selectedKey = (event.allDay ? Model.eventDateKey(event) : Model.localDateKeyFromIso(event.start)) || selectedKey
     createDateKey = selectedKey
     createAllDay = event.allDay === true
+    createIsTask = false
     createCalendarId = event.calendarId || selectedWritableCalendarId()
     creatingEvent = true
     Qt.callLater(function() {
@@ -708,6 +713,22 @@ Panel {
   }
 
   function commitCreatingEvent() {
+    if (root.createIsTask && !root.editingEvent) {
+      if (!calendarService) {
+        createError = "Calendar service is not loaded."
+        return
+      }
+      var taskCalendarId = createCalendarId || selectedWritableCalendarId()
+      if (!taskCalendarId) {
+        createError = "No writable calendar is available."
+        return
+      }
+      calendarService.createTask(taskCalendarId, titleField.text, createDateKey, true, "", 0)
+      creatingEvent = false
+      createIsTask = false
+      createError = ""
+      return
+    }
     createDateKey = Model.nextOccurrenceDate(createDateKey, createRecurrence)
     var startIso = createAllDay ? createDateKey : Model.dateTimeIso(createDateKey, createStartTime)
     var endIso = createAllDay ? Model.nextDateKey(createDateKey) : Model.endDateTimeIso(createDateKey, createStartTime, createEndTime)
@@ -996,6 +1017,22 @@ Panel {
                     onChanged: function(value) { root.setCreateDate(value) }
                   }
                   Column {
+                    visible: !root.editingEvent
+                    spacing: Style.space(4)
+                    Text {
+                      text: "Is a task"
+                      color: Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    ToggleSwitch {
+                      checked: root.createIsTask
+                      onToggled: root.createIsTask = !root.createIsTask
+                    }
+                  }
+                  Column {
+                    visible: !root.createIsTask
                     spacing: Style.space(4)
                     Text {
                       text: "All day"
@@ -1010,13 +1047,13 @@ Panel {
                     }
                   }
                   TimePicker {
-                    visible: !root.createAllDay
+                    visible: !root.createAllDay && !root.createIsTask
                     label: "Start"
                     value: root.createStartTime
                     onChanged: function(value) { root.createStartTime = value }
                   }
                   Text {
-                    visible: !root.createAllDay
+                    visible: !root.createAllDay && !root.createIsTask
                     anchors.bottom: parent.bottom
                     anchors.bottomMargin: Style.space(6)
                     text: "–"
@@ -1025,7 +1062,7 @@ Panel {
                     font.pixelSize: Style.font.body
                   }
                   TimePicker {
-                    visible: !root.createAllDay
+                    visible: !root.createAllDay && !root.createIsTask
                     label: "End"
                     value: root.createEndTime
                     onChanged: function(value) { root.createEndTime = value }
