@@ -551,6 +551,12 @@ Panel {
     return null
   }
 
+  function editContextTask(task) {
+    if (!task) return
+    root.setView("tasks")
+    tasksViewRoot.startEdit(task)
+  }
+
   function handleEventClick(event, mouse, item) {
     if (!event || event.status === "saving") return
     if (eventMenu.opened) {
@@ -1648,6 +1654,15 @@ Panel {
               var task = root.contextTask()
               root.closeEventMenu()
               if (task && calendarService) calendarService.toggleTaskComplete(task)
+            }
+          }
+          EventMenuItem {
+            visible: root.contextTask() !== null
+            text: "Edit task"
+            onClicked: {
+              var task = root.contextTask()
+              root.closeEventMenu()
+              root.editContextTask(task)
             }
           }
           EventMenuItem {
