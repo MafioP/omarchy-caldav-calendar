@@ -197,7 +197,7 @@ Item {
         start: startKey,
         end: Model.nextDateKey(startKey),
         allDay: true,
-        status: task.status || "",
+        status: task.pending === true ? "saving" : (task.status || ""),
         meetingUrl: "",
         meetingProvider: "",
         recurring: false,
@@ -714,14 +714,40 @@ Item {
     listTasksProc.running = true
   }
 
+  function optimisticTask(calendarId, id, uid, title, dueKey, allDay, description, priority, status, percentComplete) {
+    var cal = calendarById(calendarId) || {}
+    return {
+      id: id,
+      uid: uid,
+      calendarId: calendarId,
+      calendarName: cal.name || "",
+      calendarColor: cal.color || "",
+      title: title || "(No title)",
+      description: description || "",
+      due: dueKey || "",
+      allDay: allDay === true,
+      status: status || "NEEDS-ACTION",
+      completed: status === "COMPLETED",
+      percentComplete: percentComplete || 0,
+      priority: priority || 0,
+      provider: "caldav",
+      source: "Evolution Data Server",
+      pending: true
+    }
+  }
+
   function createTask(calendarId, title, dueIso, allDay, description, priority) {
     taskStatus = "saving"
     taskErrorMessage = ""
     if (createTaskProc.running) createTaskProc.running = false
+    var destId = calendarId || defaultWritableCalendarId()
+    var pendingId = "omarchy-task-pending-" + Date.now()
+    tasks = tasks.concat([optimisticTask(destId, pendingId, "", title, dueIso, allDay, description, priority, "NEEDS-ACTION", 0)])
+    showActiveRange()
     createTaskProc.command = [
       helperPath(), "create-task",
       "--provider", "evolution-data-server",
-      "--calendar-id", String(calendarId || defaultWritableCalendarId()),
+      "--calendar-id", String(destId),
       "--title", String(title || "(No title)"),
       "--due", String(dueIso || ""),
       "--description", String(description || ""),
@@ -739,6 +765,11 @@ Item {
     taskStatus = "saving"
     taskErrorMessage = ""
     if (updateTaskProc.running) updateTaskProc.running = false
+    tasks = tasks.map(function(t) {
+      if (t.id !== task.id) return t
+      return optimisticTask(t.calendarId, t.id, t.uid, title, dueIso, allDay, description, priority, status, percentComplete)
+    })
+    showActiveRange()
     updateTaskProc.command = [
       helperPath(), "update-task",
       "--provider", "evolution-data-server",
@@ -767,6 +798,8 @@ Item {
     taskStatus = "saving"
     taskErrorMessage = ""
     if (deleteTaskProc.running) deleteTaskProc.running = false
+    tasks = tasks.filter(function(t) { return t.id !== task.id })
+    showActiveRange()
     deleteTaskProc.command = [
       helperPath(), "delete-task",
       "--provider", "evolution-data-server",
@@ -797,6 +830,8 @@ Item {
       taskErrorMessage = failMessage(payload, "Could not " + label + " the task.")
       taskStatus = "error"
       root.taskSaved(false, taskErrorMessage)
+      // Roll the optimistic change back to whatever EDS actually has.
+      refreshTasks()
       return
     }
     taskStatus = "idle"

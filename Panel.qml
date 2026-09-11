@@ -2973,6 +2973,7 @@ Panel {
         height: Style.space(40)
         radius: Style.cornerRadius
         color: Util.alpha(Color.foreground, 0.04)
+        opacity: taskRow.modelData.pending ? 0.72 : 1
 
         Row {
           anchors.left: parent.left
@@ -2982,9 +2983,9 @@ Panel {
           spacing: Style.space(10)
 
           Rectangle {
-            width: Style.space(18)
-            height: Style.space(18)
-            radius: 4
+            width: Style.space(24)
+            height: Style.space(24)
+            radius: 5
             anchors.verticalCenter: parent.verticalCenter
             color: taskRow.modelData.completed ? Color.accent : "transparent"
             border.color: Color.accent
@@ -2994,7 +2995,7 @@ Panel {
               visible: taskRow.modelData.completed
               text: "✓"
               color: Color.background
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.bodySmall
             }
             MouseArea {
               anchors.fill: parent
