@@ -3015,7 +3015,7 @@ Panel {
     }
 
     Text {
-      visible: calendarService && calendarService.tasks && calendarService.tasks.length === 0
+      visible: calendarService && calendarService.uniqueTasks().length === 0
       text: "No tasks yet."
       color: Color.muted
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -3023,7 +3023,7 @@ Panel {
     }
 
     Repeater {
-      model: calendarService ? calendarService.tasks : []
+      model: calendarService ? calendarService.uniqueTasks() : []
       delegate: Rectangle {
         id: taskRow
         required property var modelData
@@ -3073,7 +3073,7 @@ Panel {
             }
             Text {
               visible: !!taskRow.modelData.due
-              text: taskRow.modelData.due ? String(taskRow.modelData.due).slice(0, 10) : ""
+              text: (taskRow.modelData.due ? String(taskRow.modelData.due).slice(0, 10) : "") + (taskRow.modelData.recurring ? " ↻" : "")
               color: Color.muted
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption - 1

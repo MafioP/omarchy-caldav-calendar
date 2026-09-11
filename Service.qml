@@ -177,6 +177,22 @@ Item {
     refreshed()
   }
 
+  function uniqueTasks() {
+    // taskEventShapes()/the grid want every expanded occurrence of a
+    // recurring task; the Tasks tab list wants the series once. Keeps the
+    // earliest (soonest-due) instance as the representative row.
+    var seen = {}
+    var out = []
+    var list = root.tasks || []
+    for (var i = 0; i < list.length; i++) {
+      var t = list[i]
+      if (!t || !t.uid || seen[t.uid]) continue
+      seen[t.uid] = true
+      out.push(t)
+    }
+    return out
+  }
+
   function taskEventShapes() {
     var out = []
     var list = root.tasks || []
